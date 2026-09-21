@@ -1,41 +1,77 @@
 USE DATABASE FOOD_DELIVERY_DEV;
-USE SCHEMA SCH_CLEAN;
+USE ROLE SYSADMIN;
+USE WAREHOUSE DEV_FOOD_WH;
+USE SCHEMA SCH_COMMON;
+
+-- Since i am using snowsight to upload files (Donot have a storage account on aws/azure/gcp)
+-- I need to refresh pipe everytime i upload a file.
+
+LIST@FOOD_DELIVERY_DEV.SCH_STAGE.CSV_STAGE/delta/location/day1_2;
+
+SELECT
+    t.$1::text as LocationID,
+    t.$2::text as City,
+    t.$3::text as State,
+    t.$4::text as ZipCode,
+    t.$5::text as ActiveFlag,
+    t.$6::text as CreatedDate,
+    t.$7::text as ModifiedDate,
+    -- audit cols
+    metadata$filename as _stg_file_name,
+    metadata$file_last_modified as _stg_file_load_ts,
+    metadata$file_content_key as _stg_file_md5,
+    current_timestamp as _copy_data_ts
+
+FROM 
+    @FOOD_DELIVERY_DEV.SCH_STAGE.CSV_STAGE/delta/location/day1_2 
+(file_format => FOOD_DELIVERY_DEV.SCH_STAGE.CSV_FILE_FORMAT) t;
+
+
+
+CREATE OR REPLACE PIPE LOCATION_PIPE 
+COMMENT = 'Pipe to Automatically ingest data into stage location table from stage'
+AS 
+COPY INTO FOOD_DELIVERY_DEV.SCH_STAGE.LOCATION (LOCATIONID, CITY, STATE, ZIPCODE, ACTIVEFLAG, CREATEDDATE, MODIFIEDDATE, _STG_FILE_NAME, _STG_FILE_LOAD_TS, _STG_FILE_MD5, _COPY_DATA_TS)
+FROM (
+    SELECT
+        t.$1::text as LocationID,
+        t.$2::text as City,
+        t.$3::text as State,
+        t.$4::text as ZipCode,
+        t.$5::text as ActiveFlag,
+        t.$6::text as CreatedDate,
+        t.$7::text as ModifiedDate,
+        -- audit cols
+        metadata$filename as _stg_file_name,
+        metadata$file_last_modified as _stg_file_load_ts,
+        metadata$file_content_key as _stg_file_md5,
+        current_timestamp as _copy_data_ts
+
+    FROM @FOOD_DELIVERY_DEV.SCH_STAGE.CSV_STAGE/delta/location/day1_2 t
+)
+file_format = (format_name = FOOD_DELIVERY_DEV.SCH_STAGE.CSV_FILE_FORMAT);
+
+show pipes;
+-- SELECT SYSTEM$PIPE_STATUS('LOCATION_PIPE');
+
+alter pipe location_pipe refresh;
 
 select * from sch_stage.location;
+select * from sch_stage.location_stream;
 
-create table sch_clean.restaurant_location (
-    restaraunt_location_sk number autoincrement primary key,
-    
-    location_id number not null unique,
-    city string(100) not null,
-    state string(100) not null,
-    zip_code string(10) not null,
-    
-    state_code string(100) not null,
-    is_union_territory boolean not null default false,
-    capital_city_flag boolean not null default false,
-    city_tier string(6),
-    
-    active_flag string(10) not null,
-    created_ts timestamp_tz not null,
-    modified_ts timestamp_tz,
-    
-    -- audit columns for tracking & debugging
-    _stg_file_name string,
-    _stg_file_load_ts timestamp_ntz,
-    _stg_file_md5 string,
-    _copy_data_ts timestamp_ntz default current_timestamp
-)comment = 'Location entity under clean schema with appropriate data type under clean schema layer, data is populated using merge statement from the stage layer location table. This table does not support SCD2';
 
--- show tables in sch_clean;
+-- Pipe stuff is done
+-- SO initial ingestion is automated just have to refresh the pipe to do the load
+-- next step have to create tasks on the condition of stream having data so that will also be automated
+-- to make sure tasks do that we have to make sure the tasks are calling to the merge operation as a stored procedure
+-- so convert all the merge operations as stored procedure
 
-create or replace stream sch_clean.restaraunt_location_stream
-on table sch_clean.restaurant_location
-comment = 'this is a standard stream object on the location table to track insert, update, and delete changes';
-
-DESC TABLE RESTAURANT_LOCATION;
-DESC TABLE SCH_STAGE.LOCATION;
-select "name" , "type" from (table(result_scan(last_query_id())));
+create or replace procedure sp_merge_to_location_clean()
+RETURNS STRING
+LANGUAGE SQL
+AS 
+$$
+BEGIN
 
 MERGE INTO sch_clean.restaurant_location AS target
 USING (
@@ -202,18 +238,188 @@ THEN INSERT (
         source._copy_data_ts
     );
 
-show streams IN SCH_STAGE;
-SELECT  * FROM RESTARAUNT_LOCATION_STREAM;
-SELECT  * FROM SCH_STAGE.LOCATION_STREAM;
-SELECT * FROM RESTAURANT_LOCATION;
- 
+    RETURN 'STAGE Location TO Clean LOCATION Merge Completed';
 
--- time travel after wrong file processing
-CREATE OR REPLACE TABLE sch_clean.restaurant_location AS
+END
+$$;
+
+
+create or replace procedure sp_merge_to_location_DIM()
+RETURNS STRING
+LANGUAGE SQL
+AS 
+$$
+BEGIN
+
+    MERGE into sch_consumption.restaurant_location_dim as target
+    using sch_clean.restaraunt_location_stream as source
+    on source.LOCATION_ID = target.LOCATION_ID and source.ACTIVE_FLAG = target.ACTIVE_FLAG
+    
+    when MATCHED
+        AND source.METADATA$ACTION = 'DELETE' AND source.METADATA$ISUPDATE = 'TRUE' THEN
+        UPDATE 
+            SET TARGET.eff_end_dt = CURRENT_TIMESTAMP(),
+                TARGET.current_flag = FALSE
+    
+    WHEN NOT MATCHED
+        AND source.METADATA$ACTION = 'INSERT' AND source.METADATA$ISUPDATE = 'TRUE' THEN
+        INSERT(
+            RESTARAUNT_LOCATION_HK,
+            LOCATION_ID,
+            CITY,
+            STATE,
+            ZIP_CODE,
+            STATE_CODE,
+            IS_UNION_TERRITORY,
+            CAPITAL_CITY_FLAG,
+            CITY_TIER,
+            ACTIVE_FLAG,
+            EFF_START_DT,
+            EFF_END_DT,
+            CURRENT_FLAG
+        )
+        VALUES(
+            HASH(SHA1_HEX(CONCAT(source.CITY,
+                        source.STATE,
+                        source.ZIP_CODE,
+                        source.STATE_CODE,
+                        source.IS_UNION_TERRITORY,
+                        source.CAPITAL_CITY_FLAG,
+                        source.CITY_TIER,
+                        source.ACTIVE_FLAG
+                    )
+                )
+            ),
+            source.LOCATION_ID,
+            source.CITY,
+            source.STATE,
+            source.ZIP_CODE,
+            source.STATE_CODE,
+            source.IS_UNION_TERRITORY,
+            source.CAPITAL_CITY_FLAG,
+            source.CITY_TIER,
+            source.ACTIVE_FLAG,
+            current_timestamp(),
+            NULL,
+            TRUE
+        )
+        
+    WHEN NOT MATCHED
+        AND source.METADATA$ACTION = 'INSERT' AND source.METADATA$ISUPDATE = 'FALSE' THEN
+        INSERT(
+            RESTARAUNT_LOCATION_HK,
+            LOCATION_ID,
+            CITY,
+            STATE,
+            ZIP_CODE,
+            STATE_CODE,
+            IS_UNION_TERRITORY,
+            CAPITAL_CITY_FLAG,
+            CITY_TIER,
+            ACTIVE_FLAG,
+            EFF_START_DT,
+            EFF_END_DT,
+            CURRENT_FLAG
+        )
+        VALUES(
+            HASH(SHA1_HEX(CONCAT(source.CITY,
+                        source.STATE,
+                        source.ZIP_CODE,
+                        source.STATE_CODE,
+                        source.IS_UNION_TERRITORY,
+                        source.CAPITAL_CITY_FLAG,
+                        source.CITY_TIER,
+                        source.ACTIVE_FLAG
+                    )
+                )
+            ),
+            source.LOCATION_ID,
+            source.CITY,
+            source.STATE,
+            source.ZIP_CODE,
+            source.STATE_CODE,
+            source.IS_UNION_TERRITORY,
+            source.CAPITAL_CITY_FLAG,
+            source.CITY_TIER,
+            source.ACTIVE_FLAG,
+            current_timestamp(),
+            NULL,
+            TRUE
+        )
+    WHEN MATCHED
+        AND source.METADATA$ACTION = 'DELETE'    AND source.METADATA$ISUPDATE = FALSE
+    THEN
+    UPDATE SET
+        EFF_END_DT = CURRENT_TIMESTAMP(),
+        CURRENT_FLAG = FALSE    
+    ;
+    
+    RETURN 'CLEAN Location TO DIM LOCATION Merge Completed';
+
+END
+$$;
+
+
+
+
+
+
+-- DONE WITH STORED PROCEDURES 
+-- NOW LETS USE THEM IN TASKS
+
+SHOW PROCEDURES;
+
+CREATE or replace TASK task_stage_to_clean_location
+WAREHOUSE = DEV_FOOD_WH
+-- schedule = '1 MINUTE'
+WHEN SYSTEM$STREAM_HAS_DATA('sch_stage.location_stream')
+AS CALL SP_MERGE_TO_LOCATION_CLEAN()
+;
+
+
+CREATE or replace TASK task_clean_to_dim_location
+WAREHOUSE = DEV_FOOD_WH
+-- schedule = '1 MINUTE'
+AFTER task_stage_to_clean_location
+WHEN SYSTEM$STREAM_HAS_DATA('sch_clean.restaraunt_location_stream')
+AS CALL sp_merge_to_location_DIM()
+;
+
+ALTER TASK task_stage_to_clean_location resume;
+
+ALTER TASK task_clean_to_dim_location resume;
+
+
+
+-- TASKS COMPLETELY CREATED 
+-- NOW NEED TO REFRESH THE PIPE
+-- EXECUTE THE FIRST TASK (OR WAIT IT WILL TAKE ONE MINUT)
+
+
+alter pipe location_pipe refresh;
+EXECUTE TASK task_stage_to_clean_location;
+
+SELECT * FROM SCH_STAGE.LOCATION_STREAM;
+SELECT * FROM SCH_CLEAN.RESTARAUNT_LOCATION_STREAM;
+
+SELECT * FROM SCH_CONSUMPTION.RESTAURANT_LOCATION_DIM;
+
+ALTER TASK task_stage_to_clean_location suspend;
+
+ALTER TASK task_clean_to_dim_location suspend;
+
 SELECT *
-FROM sch_clean.restaurant_location
-AT (
-    OFFSET => -300
-);
-SHOW STREAMS LIKE 'RESTARAUNT_LOCATION_STREAM';
-DROP STREAM IF EXISTS sch_clean.restaraunt_location_stream;
+FROM TABLE(
+    INFORMATION_SCHEMA.TASK_HISTORY(
+        TASK_NAME => 'TASK_STAGE_TO_CLEAN_LOCATION'
+    )
+)
+ORDER BY SCHEDULED_TIME DESC;
+
+SELECT *
+FROM TABLE(
+    INFORMATION_SCHEMA.TASK_HISTORY(
+        TASK_NAME => 'TASK_CLEAN_TO_DIM_LOCATION'
+    )
+)
+ORDER BY SCHEDULED_TIME DESC;
